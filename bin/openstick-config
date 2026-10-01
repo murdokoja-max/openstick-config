@@ -1,0 +1,590 @@
+#!/bin/bash
+# openstick-config — raspi-config style configuration tool for OpenStick UZ801 (MSM8916)
+# Usage: sudo openstick-config        (menu)
+#        openstick-config --status    (status summary, no menu)
+
+[ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
+
+VERSION=2.0
+TITLE="OpenStick Configuration Tool"
+ROLE=/sys/class/usb_role/ci_hdrc.0-role-switch/role
+USB_SVC=usb-host.service
+LTE_CON=lte
+USB_CON=usb
+HOTSPOT_CON=hotspot
+LAN_CON=lan
+SMS_SVC=openstick-smsd.service
+SMS_CONF=/etc/openstick-sms.conf
+RADIO_OFF_FLAG=/etc/openstick-sms.radio-off
+HS_ADDR=192.168.100.1/24     # hotspot gateway address
+LTE_FIRST_METRIC=50          # LTE route metric when "LTE first" is on (LAN=100, Wi-Fi=600)
+H=22; W=78; MH=12
+
+# ---------- dialog helpers ----------
+# Submenus get "Back", the main menu gets "Finish" (like raspi-config)
+menu() {
+  local t="$1" back="${BACK:-Back}"; shift
+  whiptail --title "$TITLE" --ok-button Select --cancel-button "$back" \
+    --menu "$t" $H $W $MH "$@" 3>&1 1>&2 2>&3
+}
+msg()    { whiptail --title "$TITLE" --scrolltext --msgbox "$1" $H $W; }
+yesno()  { whiptail --title "$TITLE" --yesno "$1" 12 $W; }
+input()  { whiptail --title "$TITLE" --inputbox "$1" 12 $W "$2" 3>&1 1>&2 2>&3; }
+secret() { whiptail --title "$TITLE" --passwordbox "$1" 10 $W 3>&1 1>&2 2>&3; }
+info()   { whiptail --title "$TITLE" --infobox "$1" 8 $W; }
+
+# Run a command, show "Done" or the error output
+run() {
+  local out rc
+  out=$("$@" 2>&1); rc=$?
+  if [ $rc -eq 0 ]; then msg "Done.${out:+\n\n${out:0:1500}}"; else msg "Failed (exit code $rc).\n\n${out:0:1500}"; fi
+  return $rc
+}
+
+warn_remote() {
+  # Confirm changes that may cut the current SSH session
+  yesno "$1\n\nIf you are connected through this link, your SSH session may drop.\nFallback access: Tailscale (openstick) or another link.\n\nContinue?"
+}
+
+# One menu row: label padded + live state
+row() { printf '%-14s %s' "$1" "$2"; }
+
+# ---------- data (read once per screen) ----------
+MMK=""; BEARER=""
+refresh() {
+  MMK=$(mmcli -m any -K 2>/dev/null)
+  BEARER=""
+  local b k
+  for b in $(sed -n "s/^modem.generic.bearers.value.*: //p" <<<"$MMK"); do
+    k=$(mmcli -b "$b" -K 2>/dev/null)
+    grep -q "^bearer.status.connected *: yes" <<<"$k" && { BEARER=$k; break; }
+  done
+}
+mmk()  { awk -F' +: ' -v k="$1" '$1==k {print $2; exit}' <<<"$MMK"; }
+bk()   { awk -F' +: ' -v k="$1" '$1==k {print $2; exit}' <<<"$BEARER"; }
+simk() { mmcli -i any -K 2>/dev/null | awk -F' +: ' -v k="$1" '$1==k {print $2; exit}'; }
+
+ipof() { ip -4 -br addr show "$1" 2>/dev/null | awk '{print $3}'; }
+con_exists() { nmcli -t -f NAME con show | grep -qx "$1"; }
+con_active() { nmcli -t -f NAME con show --active | grep -qx "$1"; }
+lan_dev() { nmcli -t -f DEVICE,TYPE dev 2>/dev/null | awk -F: '$2=="ethernet" && $1!="usb0" {print $1; exit}'; }
+wifi_ssid() { nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null | awk -F: '$1=="yes"{print $2; exit}'; }
+usb_boot() { systemctl is-enabled $USB_SVC 2>/dev/null | sed 's/enabled/host/;s/disabled/device/'; }
+sms_conf() { (. $SMS_CONF 2>/dev/null; eval echo "\${$1:-$2}"); }
+# Set KEY=value in the SMS config (add the line if missing) and restart the service
+sms_set() {
+  if grep -q "^$1=" $SMS_CONF; then sed -i "s|^$1=.*|$1=$2|" $SMS_CONF; else echo "$1=$2" >> $SMS_CONF; fi
+  systemctl is-active -q $SMS_SVC && systemctl restart $SMS_SVC
+}
+
+# LTE address from the connected bearer: lte_ip (IPv4) / lte_ip 6 (IPv6)
+lte_ip() {
+  [ -n "$BEARER" ] || { echo "data off"; return; }
+  local f=ipv4; [ "$1" = 6 ] && f=ipv6
+  local a p; a=$(bk bearer.$f-config.address); p=$(bk bearer.$f-config.prefix)
+  if [ -n "$a" ] && [ "$a" != "--" ]; then echo "$a/$p"
+  elif [ "$1" = 6 ]; then echo "-"; else echo "IPv4 failed"; fi
+}
+
+temps() {
+  local z
+  for z in /sys/class/thermal/thermal_zone*; do
+    printf '%s %sC  ' "$(sed 's/-thermal//' $z/type)" $(( $(cat $z/temp) / 1000 ))
+  done
+}
+
+# Short one-line states for menu rows
+st_wifi() {
+  [ "$(nmcli radio wifi)" = enabled ] || { echo "off"; return; }
+  con_active "$HOTSPOT_CON" && { echo "on · hotspot mode"; return; }
+  local s; s=$(wifi_ssid); echo "on · ${s:-not connected}${s:+ · $(ipof wlan0)}"
+}
+st_hotspot() { con_active "$HOTSPOT_CON" && echo "on · $(nmcli -g 802-11-wireless.ssid con show $HOTSPOT_CON)" || echo "off"; }
+st_lte() {
+  local s; s=$(mmk modem.generic.state)
+  [ -n "$s" ] || { echo "no modem"; return; }
+  echo "$s · $(mmk modem.3gpp.operator-name) · $(mmk modem.generic.signal-quality.value)% · $(lte_ip)"
+}
+st_lan() {
+  local d; d=$(lan_dev); [ -n "$d" ] || { echo "no adapter"; return; }
+  local ip; ip=$(ipof "$d"); echo "$(cat /sys/class/net/$d/operstate)${ip:+ · $ip}"
+}
+st_usbnet() { [ "$(cat $ROLE 2>/dev/null)" = device ] && echo "$(cat /sys/class/net/usb0/operstate 2>/dev/null) · $(ipof usb0)" || echo "unavailable (USB in host mode)"; }
+st_ts() { local ip; ip=$(tailscale ip -4 2>/dev/null | head -1); echo "${ip:-down}"; }
+st_sms() { echo "$(systemctl is-active $SMS_SVC) · $([ "$(sms_conf SENDERS whitelist)" = any ] && echo "any sender" || echo "whitelist: $(sms_conf ALLOWED none)")"; }
+st_usb() { echo "$(cat $ROLE 2>/dev/null) · boot: $(usb_boot)"; }
+
+# ---------- status screen ----------
+status_text() {
+  refresh
+  cat <<EOF
+SYSTEM
+  Host       $(hostname) · up $(uptime -p | sed 's/^up //')
+  Time       $(date '+%Y-%m-%d %H:%M') ($(timedatectl show -p Timezone --value))
+  Temp       $(temps)
+  Disk/RAM   $(df -h / | awk 'NR==2{print $3" / "$2" ("$5")"}') · RAM free $(free -m | awk '/Mem/{print $7" MiB"}')
+
+NETWORK
+  Wi-Fi      $(st_wifi)
+  Hotspot    $(st_hotspot)$(con_active "$HOTSPOT_CON" && echo " · internet via $(hotspot_uplink)")
+  LTE        $(mmk modem.generic.state) · $(mmk modem.3gpp.operator-name) · $(mmk 'modem.generic.access-technologies.value[1]') · signal $(mmk modem.generic.signal-quality.value)%
+    IPv4     $(lte_ip)
+    IPv6     $(lte_ip 6)
+    APN      $(nmcli -g gsm.apn con show "$LTE_CON" 2>/dev/null)
+  LAN        $(lan_dev) $(st_lan)
+  USB net    $(st_usbnet)
+  Tailscale  $(st_ts)
+
+CONTROL
+  USB mode   $(st_usb)
+  SMS        $(st_sms) · reply: $(sms_conf REPLY no)
+EOF
+}
+
+# ---------- generic IP settings ----------
+ip_menu() {
+  # $1 = NM connection, $2 = label, $3 = 1 to allow internet sharing
+  local con="$1" label="$2" cur c addr gw dns
+  cur=$(nmcli -g ipv4.method,ipv4.addresses,ipv4.gateway con show "$con" 2>/dev/null | paste -sd' ')
+  local items=(1 "DHCP (automatic)" 2 "Static IP")
+  [ "$3" = 1 ] && items+=(3 "Share internet (router: DHCP server + NAT)")
+  c=$(menu "IP settings · $label\nCurrent: ${cur:-?}" "${items[@]}") || return
+  case $c in
+    1) nmcli con modify "$con" ipv4.method auto ipv4.addresses "" ipv4.gateway "" ipv4.dns "" || return ;;
+    2) addr=$(input "IP address/prefix for $label\nExample: 192.168.1.50/24" "") || return
+       [[ "$addr" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || { msg "Invalid format. Use a.b.c.d/prefix"; return; }
+       gw=$(input "Gateway (leave empty if not needed)" "") || return
+       dns=$(input "DNS servers, separated by spaces (leave empty if not needed)" "") || return
+       nmcli con modify "$con" ipv4.method manual ipv4.addresses "$addr" ipv4.gateway "$gw" ipv4.dns "$dns" || return ;;
+    3) addr=$(input "Router IP on $label (clients get DHCP from this subnet)" "10.42.0.1/24") || return
+       nmcli con modify "$con" ipv4.method shared ipv4.addresses "$addr" ipv4.gateway "" ipv4.dns "" || return ;;
+  esac
+  warn_remote "Apply the new IP settings to $label now?" || { msg "Saved. It takes effect the next time $label connects."; return; }
+  run nmcli con up "$con"
+}
+
+# ---------- Wi-Fi ----------
+wifi_connect() {
+  local list=() ssids=() i=0 line sig sec ssid c pw
+  info "Scanning for Wi-Fi networks..."
+  nmcli con down "$HOTSPOT_CON" >/dev/null 2>&1
+  while IFS= read -r line; do
+    sig=${line%%:*}; line=${line#*:}; sec=${line%%:*}; ssid=${line#*:}
+    ssid=${ssid//\\:/:}
+    [ -z "$ssid" ] && continue
+    printf '%s\n' "${ssids[@]}" | grep -qxF "$ssid" && continue
+    ssids+=("$ssid"); list+=("$i" "$(printf '%-28s %3s%%  %s' "$ssid" "$sig" "${sec:-open}")"); i=$((i+1))
+  done < <(nmcli -t -f SIGNAL,SECURITY,SSID dev wifi list --rescan yes 2>/dev/null)
+  [ $i -eq 0 ] && { msg "No networks found."; return; }
+  c=$(menu "Select a Wi-Fi network:" "${list[@]}") || return
+  ssid=${ssids[$c]}
+  con_exists "$ssid" && { run nmcli con up "$ssid"; return; }
+  pw=$(secret "Password for \"$ssid\" (leave empty for an open network):") || return
+  info "Connecting to $ssid..."
+  if [ -n "$pw" ]; then run nmcli dev wifi connect "$ssid" password "$pw"
+  else run nmcli dev wifi connect "$ssid"; fi
+}
+
+wifi_pick_saved() {
+  # Echo the chosen saved Wi-Fi client profile
+  local list=() n t
+  while IFS=: read -r n t; do
+    [ "$t" = 802-11-wireless ] && [ "$n" != "$HOTSPOT_CON" ] && list+=("$n" "")
+  done < <(nmcli -t -f NAME,TYPE con show)
+  [ ${#list[@]} -eq 0 ] && { msg "No saved networks."; return 1; }
+  menu "$1" "${list[@]}"
+}
+
+wifi_menu() {
+  local c n on
+  while true; do
+    on=$(nmcli radio wifi)
+    c=$(menu "Network › Wi-Fi\n$(st_wifi)" \
+        1 "$(row "Wi-Fi radio" "$([ "$on" = enabled ] && echo "ON  → turn off" || echo "OFF → turn on")")" \
+        2 "Connect to a network" \
+        3 "Forget a saved network" \
+        4 "IP settings (DHCP / static)" \
+        5 "Details") || return
+    case $c in
+      1) if [ "$on" = enabled ]; then warn_remote "Turn Wi-Fi off?" && run nmcli radio wifi off
+         else run nmcli radio wifi on; fi ;;
+      2) wifi_connect ;;
+      3) n=$(wifi_pick_saved "Forget a saved network:") || continue
+         yesno "Forget network \"$n\"?" && run nmcli con delete "$n" ;;
+      4) n=$(wifi_pick_saved "Select a network to configure:") || continue
+         ip_menu "$n" "Wi-Fi \"$n\"" 0 ;;
+      5) msg "$(nmcli -f GENERAL.STATE,GENERAL.CONNECTION,GENERAL.HWADDR,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS dev show wlan0)\n\nNearby networks:\n$(nmcli -f IN-USE,SSID,SIGNAL,SECURITY dev wifi list | head -10)" ;;
+    esac
+  done
+}
+
+hotspot_prepare() {
+  # Image design: static gateway on wlan0, DHCP from the system dnsmasq (/etc/dnsmasq.conf),
+  # NAT from /etc/iptables/rules.v4. Only IP forwarding has to be switched on.
+  nmcli con modify "$HOTSPOT_CON" ipv4.method manual ipv4.addresses "$HS_ADDR" ipv4.routing-rules "" ipv6.method disabled \
+    wifi-sec.key-mgmt wpa-psk wifi-sec.proto rsn wifi-sec.pairwise ccmp wifi-sec.group ccmp || return 1
+  echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/90-openstick-forward.conf
+  sysctl -q -w net.ipv4.ip_forward=1
+  systemctl is-active -q dnsmasq || systemctl restart dnsmasq
+}
+
+# Internet source for the modem (and hotspot clients). The kernel has no policy routing,
+# so "LTE first" lowers the LTE route metric below LAN/Wi-Fi for all traffic.
+lte_first() { [ "$(nmcli -g ipv4.route-metric con show "$LTE_CON")" = "$LTE_FIRST_METRIC" ]; }
+set_lte_first() {
+  local m=-1; [ "$1" = on ] && m=$LTE_FIRST_METRIC
+  nmcli con modify "$LTE_CON" ipv4.route-metric $m ipv6.route-metric $m || return 1
+  con_active "$LTE_CON" && nmcli dev reapply wwan0qmi0 >/dev/null 2>&1
+  return 0
+}
+
+hotspot_uplink() {
+  # Interface that carries internet traffic right now
+  local d; d=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+  case $d in wwan*) echo "LTE" ;; wlan*) echo "Wi-Fi" ;; "") echo "none" ;; *) echo "LAN ($d)" ;; esac
+}
+
+hotspot_clients() {
+  local f=/var/lib/misc/dnsmasq.leases
+  [ -s "$f" ] && awk '{printf "  %-15s %-17s %s\n", $3, $2, ($4=="*"?"-":$4)}' "$f" || echo "  (none)"
+}
+
+hotspot_menu() {
+  local c ssid pw on auto
+  con_exists "$HOTSPOT_CON" || { msg "Hotspot profile not found."; return; }
+  while true; do
+    con_active "$HOTSPOT_CON" && on=1 || on=0
+    auto=$(nmcli -g connection.autoconnect con show $HOTSPOT_CON)
+    ssid=$(nmcli -g 802-11-wireless.ssid con show $HOTSPOT_CON)
+    pw=$(nmcli -s -g 802-11-wireless-security.psk con show $HOTSPOT_CON)
+    c=$(menu "Network › Hotspot · $([ $on = 1 ] && echo "ON · internet via $(hotspot_uplink)" || echo OFF)\nHotspot and Wi-Fi client cannot run at the same time." \
+        1 "$(row "Hotspot" "$([ $on = 1 ] && echo "ON  → turn off (back to Wi-Fi client)" || echo "OFF → turn on (Wi-Fi client disconnects)")")" \
+        2 "$(row "SSID" "$ssid")" \
+        3 "$(row "Password" "$pw")" \
+        4 "$(row "Internet via" "$(lte_first && echo "LTE first → change to LAN/Wi-Fi first" || echo "LAN/Wi-Fi first → change to LTE first")")" \
+        5 "$(row "Start at boot" "$([ "$auto" = yes ] && echo "YES → disable" || echo "NO  → enable")")" \
+        6 "Connected clients") || return
+    case $c in
+      1) if [ $on = 1 ]; then
+           nmcli con down "$HOTSPOT_CON" >/dev/null 2>&1; nmcli dev wifi rescan >/dev/null 2>&1; sleep 3
+           run nmcli dev connect wlan0
+         else
+           warn_remote "The Wi-Fi client will be disconnected and replaced by the hotspot." || continue
+           nmcli radio wifi on; hotspot_prepare || { msg "Could not prepare the hotspot profile."; continue; }
+           info "Starting hotspot..."
+           run nmcli con up "$HOTSPOT_CON" && msg "Hotspot is on.\n\nSSID      $ssid\nPassword  $pw\nGateway   ${HS_ADDR%/*}\nInternet  via $(hotspot_uplink)"
+         fi ;;
+      2) ssid=$(input "New hotspot SSID:" "$ssid") || continue
+         [ -n "$ssid" ] || { msg "The SSID cannot be empty."; continue; }
+         run nmcli con modify "$HOTSPOT_CON" 802-11-wireless.ssid "$ssid" && [ $on = 1 ] && nmcli con up "$HOTSPOT_CON" >/dev/null 2>&1 ;;
+      3) pw=$(input "New hotspot password (at least 8 characters):" "$pw") || continue
+         [ ${#pw} -ge 8 ] || { msg "The password must be at least 8 characters."; continue; }
+         run nmcli con modify "$HOTSPOT_CON" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$pw" && [ $on = 1 ] && nmcli con up "$HOTSPOT_CON" >/dev/null 2>&1 ;;
+      4) if lte_first; then
+           run set_lte_first off && msg "Internet now prefers LAN/Wi-Fi; LTE is the backup.\nCurrent route: $(hotspot_uplink)"
+         else
+           con_active "$LTE_CON" || msg "Note: mobile data is off. Turn it on under Network › LTE modem for this to take effect."
+           yesno "Prefer LTE for internet?\n\nThe kernel has no per-client routing, so this applies to ALL traffic of the modem (and its hotspot clients). LAN/Wi-Fi become the backup.\n\nThis uses mobile data quota and makes the modem warmer." && \
+             run set_lte_first on && msg "Internet now prefers LTE.\nCurrent route: $(hotspot_uplink)"
+         fi ;;
+      6) msg "Hotspot clients (IP / MAC / name):\n\n$(hotspot_clients)" ;;
+      5) if [ "$auto" = yes ]; then run nmcli con modify "$HOTSPOT_CON" connection.autoconnect no
+         else yesno "The hotspot will start at boot and replace the Wi-Fi client. Continue?" && \
+           { hotspot_prepare; run nmcli con modify "$HOTSPOT_CON" connection.autoconnect yes connection.autoconnect-priority 20; }; fi ;;
+    esac
+  done
+}
+
+# ---------- LTE modem ----------
+lte_details() {
+  refresh
+  msg "State        $(mmk modem.generic.state)  (power: $(mmk modem.generic.power-state))
+Operator     $(mmk modem.3gpp.operator-name)  [$(mmk modem.3gpp.operator-code)]
+Registration $(mmk modem.3gpp.registration-state)
+Technology   $(mmk 'modem.generic.access-technologies.value[1]')
+Signal       $(mmk modem.generic.signal-quality.value)%
+Modes        $(mmk modem.generic.current-modes)
+
+IPv4         $(lte_ip)
+IPv6         $(lte_ip 6)
+APN          $(nmcli -g gsm.apn con show $LTE_CON 2>/dev/null)
+Data at boot $(nmcli -g connection.autoconnect con show $LTE_CON 2>/dev/null)
+Firmware     $(mmk modem.generic.revision)"
+}
+
+lte_ids() {
+  refresh
+  msg "Modem and SIM identity (display only)
+
+IMEI       $(mmk modem.3gpp.imei)
+ICCID      $(simk sim.properties.iccid)
+IMSI       $(simk sim.properties.imsi)
+Operator   $(simk sim.properties.operator-name)
+
+Changing an IMEI violates IMEI regulations in Indonesia
+and can get the device blocked from the network."
+}
+
+lte_apn() {
+  local apn user pass
+  apn=$(input "APN (e.g. internet for XL/Telkomsel, indosatgprs, 3gprs)" "$(nmcli -g gsm.apn con show $LTE_CON)") || return
+  user=$(input "APN username (leave empty if none)" "$(nmcli -g gsm.username con show $LTE_CON)") || return
+  pass=$(input "APN password (leave empty if none)" "") || return
+  nmcli con modify "$LTE_CON" gsm.apn "$apn" gsm.username "$user" gsm.password "$pass" || return
+  con_active "$LTE_CON" || { msg "APN saved. It is used the next time mobile data turns on."; return; }
+  info "Reconnecting LTE..."
+  nmcli con down "$LTE_CON" >/dev/null 2>&1
+  run nmcli con up "$LTE_CON"
+}
+
+lte_mode() {
+  local c
+  c=$(menu "Network › LTE › Network mode\nCurrent: $(mmk modem.generic.current-modes)" \
+      1 "4G only" \
+      2 "4G/3G, prefer 4G" \
+      3 "4G/3G, prefer 3G" \
+      4 "3G only") || return
+  case $c in
+    1) run mmcli -m any --set-allowed-modes=4g ;;
+    2) run mmcli -m any --set-allowed-modes='3g|4g' --set-preferred-mode=4g ;;
+    3) run mmcli -m any --set-allowed-modes='3g|4g' --set-preferred-mode=3g ;;
+    4) run mmcli -m any --set-allowed-modes=3g ;;
+  esac
+}
+
+lte_menu() {
+  local c data radio
+  while true; do
+    refresh
+    con_active "$LTE_CON" && data=1 || data=0
+    [ "$(mmk modem.generic.state)" = disabled ] && radio=0 || radio=1
+    c=$(menu "Network › LTE modem\n$(st_lte)\nIPv6: $(lte_ip 6)" \
+        1 "$(row "Mobile data" "$([ $data = 1 ] && echo "ON  → turn off (radio stays on for SMS)" || echo "OFF → turn on (also at boot)")")" \
+        2 "$(row "Radio" "$([ $radio = 1 ] && echo "ON  → turn fully off (no SMS)" || echo "OFF → turn on")")" \
+        3 "$(row "APN" "$(nmcli -g gsm.apn con show $LTE_CON 2>/dev/null)")" \
+        4 "$(row "Network mode" "$(mmk modem.generic.current-modes | sed 's/allowed: //;s/preferred: /prefer /')")" \
+        5 "IP / DNS settings" \
+        6 "SIM and IMEI info" \
+        7 "Restart modem" \
+        8 "Details") || return
+    case $c in
+      1) if [ $data = 1 ]; then
+           warn_remote "Turn mobile data off? (Tailscale over LTE drops if no other link)" || continue
+           nmcli con modify "$LTE_CON" connection.autoconnect no; run nmcli con down "$LTE_CON"
+         else
+           rm -f "$RADIO_OFF_FLAG"; nmcli con modify "$LTE_CON" connection.autoconnect yes
+           mmcli -m any -e >/dev/null 2>&1; info "Connecting LTE..."; run nmcli con up "$LTE_CON"
+         fi ;;
+      2) if [ $radio = 1 ]; then
+           warn_remote "Turn the LTE radio fully off? Mobile data stops and SMS commands are not received until the radio is on again." || continue
+           touch "$RADIO_OFF_FLAG"; nmcli con modify "$LTE_CON" connection.autoconnect no
+           nmcli con down "$LTE_CON" >/dev/null 2>&1; run mmcli -m any -d
+         else
+           rm -f "$RADIO_OFF_FLAG"; run mmcli -m any -e
+         fi ;;
+      3) lte_apn ;;
+      4) lte_mode ;;
+      5) ip_menu "$LTE_CON" "LTE" 0 ;;
+      6) lte_ids ;;
+      7) warn_remote "Restart the LTE modem?" || continue
+         nmcli con down "$LTE_CON" >/dev/null 2>&1; mmcli -m any -d >/dev/null 2>&1; sleep 2
+         mmcli -m any -e >/dev/null 2>&1
+         if [ $data = 1 ]; then info "Reconnecting LTE..."; run nmcli con up "$LTE_CON"; else msg "Modem restarted. Mobile data stays off."; fi ;;
+      8) lte_details ;;
+    esac
+  done
+}
+
+# ---------- LAN (USB Ethernet adapter) ----------
+lan_ensure() {
+  # Use one profile named "lan" for the adapter; adopt NetworkManager's auto profile if present
+  local dev cur; dev=$(lan_dev)
+  [ -n "$dev" ] || { msg "No USB LAN adapter detected.\nMake sure USB mode is host and the adapter is plugged into the hub."; return 1; }
+  if ! con_exists "$LAN_CON"; then
+    cur=$(nmcli -g GENERAL.CONNECTION dev show "$dev" 2>/dev/null)
+    if [ -n "$cur" ] && [ "$cur" != "--" ]; then
+      nmcli con modify "$cur" connection.id "$LAN_CON" connection.interface-name "$dev" >/dev/null || return 1
+    else
+      nmcli con add type ethernet ifname "$dev" con-name "$LAN_CON" ipv4.method auto connection.autoconnect yes >/dev/null || return 1
+    fi
+  elif [ "$(nmcli -g connection.interface-name con show $LAN_CON)" != "$dev" ]; then
+    nmcli con modify "$LAN_CON" connection.interface-name "$dev"
+  fi
+  LANDEV=$dev
+}
+
+lan_menu() {
+  local c on
+  while true; do
+    lan_ensure || return
+    con_active "$LAN_CON" && on=1 || on=0
+    c=$(menu "Network › LAN ($LANDEV)\n$(st_lan) · method: $(nmcli -g ipv4.method con show $LAN_CON)" \
+        1 "$(row "LAN" "$([ $on = 1 ] && echo "ON  → turn off (stays off after boot)" || echo "OFF → turn on (also at boot)")")" \
+        2 "IP settings (DHCP / static / share internet)" \
+        3 "Details") || return
+    case $c in
+      1) if [ $on = 1 ]; then
+           warn_remote "Turn LAN off?" || continue
+           nmcli con modify "$LAN_CON" connection.autoconnect no; run nmcli con down "$LAN_CON"
+         else
+           nmcli con modify "$LAN_CON" connection.autoconnect yes; run nmcli con up "$LAN_CON"
+         fi ;;
+      2) ip_menu "$LAN_CON" "LAN" 1 ;;
+      3) msg "$(nmcli -f GENERAL.DEVICE,GENERAL.HWADDR,GENERAL.STATE,CAPABILITIES.SPEED,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS dev show $LANDEV)" ;;
+    esac
+  done
+}
+
+# ---------- Tailscale ----------
+ts_menu() {
+  local c exitnode
+  while true; do
+    tailscale debug prefs 2>/dev/null | tr -d ' \n' | grep -q '"AdvertiseRoutes":\[[^]]*0\.0\.0\.0/0' && exitnode=1 || exitnode=0
+    c=$(menu "Network › Tailscale\n$(st_ts) · $(tailscale status --json 2>/dev/null | grep -m1 '"BackendState"' | cut -d'"' -f4)" \
+        1 "Connect (tailscale up)" \
+        2 "Disconnect (tailscale down)" \
+        3 "$(row "Exit node" "$([ $exitnode = 1 ] && echo "ON  → turn off" || echo "OFF → turn on (route internet through this modem)")")" \
+        4 "Details") || return
+    case $c in
+      1) run timeout 20 tailscale up ;;
+      2) warn_remote "Disconnect Tailscale?" && run tailscale down ;;
+      3) if [ $exitnode = 1 ]; then run tailscale set --advertise-exit-node=false
+         else
+           printf 'net.ipv4.ip_forward=1\nnet.ipv6.conf.all.forwarding=1\n' > /etc/sysctl.d/99-tailscale.conf
+           sysctl -p /etc/sysctl.d/99-tailscale.conf >/dev/null
+           run tailscale set --advertise-exit-node=true && \
+             msg "Approve the exit node in the Tailscale admin console:\nhttps://login.tailscale.com/admin/machines"
+         fi ;;
+      4) msg "$(tailscale status 2>&1 | head -20)" ;;
+    esac
+  done
+}
+
+# ---------- Network (hub) ----------
+network_menu() {
+  local c
+  while true; do
+    refresh
+    c=$(menu "Network" \
+        1 "$(row "Wi-Fi" "$(st_wifi)")" \
+        2 "$(row "Hotspot" "$(st_hotspot)")" \
+        3 "$(row "LTE modem" "$(st_lte)")" \
+        4 "$(row "LAN" "$(st_lan)")" \
+        5 "$(row "USB network" "$(st_usbnet)")" \
+        6 "$(row "Tailscale" "$(st_ts)")") || return
+    case $c in
+      1) wifi_menu ;;
+      2) hotspot_menu ;;
+      3) lte_menu ;;
+      4) lan_menu ;;
+      5) [ "$(cat $ROLE)" = device ] && ip_menu "$USB_CON" "USB network (usb0)" 1 || \
+           msg "USB network (usb0) only works in USB device mode.\nChange it under: USB mode." ;;
+      6) ts_menu ;;
+    esac
+  done
+}
+
+# ---------- SMS remote control ----------
+sms_menu() {
+  local c nums active reply senders
+  while true; do
+    [ "$(systemctl is-active $SMS_SVC)" = active ] && active=1 || active=0
+    reply=$(sms_conf REPLY no)
+    senders=$(sms_conf SENDERS whitelist)
+    c=$(menu "SMS control\nCommands: lte on · lte off · wifi on · wifi off · status" \
+        1 "$(row "SMS control" "$([ $active = 1 ] && echo "ON  → turn off" || echo "OFF → turn on (also at boot)")")" \
+        2 "$(row "Senders" "$([ "$senders" = any ] && echo "ANY number → change to whitelist" || echo "WHITELIST → change to any number")")" \
+        3 "$(row "Whitelist" "$(sms_conf ALLOWED none)$([ "$senders" = any ] && echo "  (not used)")")" \
+        4 "$(row "Replies" "$([ "$reply" = yes ] && echo "ON  → turn off" || echo "OFF → turn on (each reply costs credit)")")" \
+        5 "View log") || return
+    case $c in
+      1) if [ $active = 1 ]; then run systemctl disable --now $SMS_SVC; else run systemctl enable --now $SMS_SVC; fi ;;
+      2) if [ "$senders" = any ]; then sms_set SENDERS whitelist
+         else
+           yesno "Accept commands from ANY number?\n\nAnyone who knows the SIM number could then turn LTE data or Wi-Fi on/off (and use your quota). Use the whitelist unless you really need this." && sms_set SENDERS any
+         fi ;;
+      3) nums=$(input "Whitelisted numbers, separated by spaces (e.g. +6281234567890):" "$(sms_conf ALLOWED)") || continue
+         [[ "$nums" =~ ^[0-9+\ ]*$ ]] || { msg "Only digits, + and spaces are allowed."; continue; }
+         sms_set ALLOWED "\"$nums\"" ;;
+      4) if [ "$reply" = yes ]; then sms_set REPLY no; else sms_set REPLY yes; fi ;;
+      5) msg "$(journalctl -u $SMS_SVC -n 30 --no-pager -o short 2>&1 | cut -c1-150)" ;;
+    esac
+  done
+}
+
+# ---------- USB mode ----------
+usb_menu() {
+  local c now boot
+  while true; do
+    now=$(cat $ROLE); boot=$(usb_boot)
+    c=$(menu "USB mode\nhost   = modem uses the hub: USB LAN, keyboard, flash drive\ndevice = modem is a USB network adapter for a PC (192.168.200.1)" \
+        1 "$(row "Now" "$now → switch to $([ "$now" = host ] && echo device || echo host)")" \
+        2 "$(row "At boot" "$boot → change to $([ "$boot" = host ] && echo device || echo host)")" \
+        3 "Show USB devices (lsusb)") || return
+    case $c in
+      1) if [ "$now" = host ]; then
+           warn_remote "Switch to DEVICE mode? The hub, USB LAN and other USB devices disconnect." && { echo device > $ROLE; sleep 2; }
+         else
+           warn_remote "Switch to HOST mode? The USB link to the PC (usb0) drops." && { echo host > $ROLE; sleep 3; msg "$(lsusb 2>&1)"; }
+         fi ;;
+      2) if [ "$boot" = host ]; then run systemctl disable $USB_SVC; else run systemctl enable $USB_SVC; fi ;;
+      3) msg "$(lsusb 2>&1)\n\n$(lsusb -t 2>&1)" ;;
+    esac
+  done
+}
+
+# ---------- System ----------
+sys_menu() {
+  local c u p1 p2 h tz
+  u=${SUDO_USER:-admin}
+  while true; do
+    c=$(menu "System\n$(hostname) · up $(uptime -p | sed 's/^up //')\n$(temps)" \
+        1 "$(row "Password" "change for user $u")" \
+        2 "$(row "Hostname" "$(hostname)")" \
+        3 "$(row "Timezone" "$(timedatectl show -p Timezone --value)")" \
+        4 "View system log" \
+        5 "Reboot" \
+        6 "Shut down") || return
+    case $c in
+      1) p1=$(secret "New password for $u:") || continue
+         p2=$(secret "Repeat the new password:") || continue
+         [ -n "$p1" ] && [ "$p1" = "$p2" ] || { msg "Password is empty or does not match."; continue; }
+         echo "$u:$p1" | chpasswd && msg "Password for $u changed." || msg "Failed to change the password." ;;
+      2) h=$(input "New hostname (letters, digits, -):" "$(hostname)") || continue
+         [[ "$h" =~ ^[a-zA-Z0-9-]{1,63}$ ]] || { msg "Invalid hostname."; continue; }
+         hostnamectl set-hostname "$h"
+         sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$h/" /etc/hosts
+         grep -q '^127\.0\.1\.1' /etc/hosts || echo -e "127.0.1.1\t$h" >> /etc/hosts
+         msg "Hostname changed to $h.\nThe Tailscale name does not change; to update it run: tailscale set --hostname=$h" ;;
+      3) tz=$(menu "Select a timezone:" \
+              Asia/Jakarta "WIB (UTC+7)" Asia/Makassar "WITA (UTC+8)" Asia/Jayapura "WIT (UTC+9)" UTC "UTC") || continue
+         run timedatectl set-timezone "$tz" ;;
+      4) msg "$(journalctl -n 40 --no-pager -o short 2>&1 | cut -c1-160)" ;;
+      5) yesno "Reboot now?" && { clear; reboot; exit 0; } ;;
+      6) yesno "Shut down the modem now? It can only be powered on again by unplugging and replugging power." && { clear; poweroff; exit 0; } ;;
+    esac
+  done
+}
+
+# ---------- main ----------
+if [ "${1:-}" = "--status" ]; then status_text; exit 0; fi
+command -v whiptail >/dev/null || { echo "whiptail is not installed: sudo apt install whiptail"; exit 1; }
+
+while true; do
+  refresh
+  c=$(BACK=Finish menu "$(hostname) · LTE $(mmk modem.generic.state) · Wi-Fi $(nmcli radio wifi) · $(temps | awk '{print $1" "$2}')" \
+      1 "$(row "Status" "overview of all connections")" \
+      2 "$(row "Network" "Wi-Fi · Hotspot · LTE · LAN · USB · Tailscale")" \
+      3 "$(row "SMS control" "$(st_sms)")" \
+      4 "$(row "USB mode" "$(st_usb)")" \
+      5 "$(row "System" "password · hostname · timezone · reboot")" \
+      6 "$(row "About" "openstick-config $VERSION")") || { clear; exit 0; }
+  case $c in
+    1) msg "$(status_text)" ;;
+    2) network_menu ;;
+    3) sms_menu ;;
+    4) usb_menu ;;
+    5) sys_menu ;;
+    6) msg "openstick-config $VERSION\nConfiguration tool for the OpenStick UZ801 modem (MSM8916)\nDebian $(cat /etc/debian_version), kernel $(uname -r)\n\nRun: sudo openstick-config\nQuick status: openstick-config --status" ;;
+  esac
+done

@@ -1,0 +1,123 @@
+#!/bin/bash
+# openstick-smsd — SMS remote control for OpenStick
+# Commands (case-insensitive), accepted only from numbers in ALLOWED:
+#   lte on | lte off | wifi on | wifi off | status
+# "lte off" only stops LTE data; the radio stays registered so SMS keeps arriving.
+
+CONF=/etc/openstick-sms.conf
+ALLOWED=""
+SENDERS=whitelist   # whitelist = only ALLOWED numbers, any = every sender
+REPLY=no
+INTERVAL=10
+LTE_CON=lte
+RADIO_OFF_FLAG=/etc/openstick-sms.radio-off
+[ -f "$CONF" ] && . "$CONF"
+
+log() { echo "$*"; }  # stdout goes to the journal (tag: openstick-smsd)
+
+# Normalize phone number to 62xxxxxxxx
+norm() { local n=${1//[^0-9]/}; [[ $n == 0* ]] && n=62${n#0}; echo "$n"; }
+
+allowed() {
+  [ "$SENDERS" = any ] && return 0
+  local n a; n=$(norm "$1")
+  [ -n "$n" ] || return 1
+  for a in $ALLOWED; do [ "$(norm "$a")" = "$n" ] && return 0; done
+  return 1
+}
+
+mmk() { mmcli -m any -K 2>/dev/null | awk -F' +: ' -v k="$1" '$1==k {print $2; exit}'; }
+smsk() { awk -F' +: ' -v k="$1" '$1==k {sub(/^[^:]*: /, ""); print; exit}' <<<"$2"; }
+
+reply() {
+  [ "$REPLY" = yes ] || return 0
+  local to="$1" text="${2//\'/}" path
+  path=$(mmcli -m any --messaging-create-sms="text='$text',number='$to'" 2>/dev/null | grep -o 'SMS/[0-9]*' | cut -d/ -f2)
+  [ -n "$path" ] || { log "reply: failed to create SMS"; return 1; }
+  mmcli -s "$path" --send >/dev/null 2>&1 && log "reply sent to $to: $text" || log "reply: send failed"
+  mmcli -m any --messaging-delete-sms="$path" >/dev/null 2>&1
+}
+
+status_line() {
+  local t
+  t=$(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 ))
+  echo "LTE $(nmcli -t -f NAME con show --active | grep -qx "$LTE_CON" && echo on || echo off) $(ip -4 -br addr show wwan0 2>/dev/null | awk '{print $3}')" \
+       "WIFI $(nmcli radio wifi) $(ip -4 -br addr show wlan0 2>/dev/null | awk '{print $3}')" \
+       "SIG $(mmk modem.generic.signal-quality.value)% TEMP ${t}C"
+}
+
+handle() {
+  local from="$1" cmd="$2"
+  case "$cmd" in
+    "lte on")
+      rm -f "$RADIO_OFF_FLAG"
+      mmcli -m any -e >/dev/null 2>&1
+      nmcli con modify "$LTE_CON" connection.autoconnect yes
+      if nmcli con up "$LTE_CON" >/dev/null 2>&1; then log "LTE data on (by $from)"; else log "LTE data on FAILED (by $from)"; fi
+      reply "$from" "$(status_line)" ;;
+    "lte off")
+      nmcli con modify "$LTE_CON" connection.autoconnect no
+      nmcli con down "$LTE_CON" >/dev/null 2>&1
+      log "LTE data off, radio kept on for SMS (by $from)"
+      reply "$from" "$(status_line)" ;;
+    "wifi on")
+      nmcli radio wifi on; log "Wi-Fi on (by $from)"
+      sleep 15; reply "$from" "$(status_line)" ;;
+    "wifi off")
+      nmcli radio wifi off; log "Wi-Fi off (by $from)"
+      reply "$from" "$(status_line)" ;;
+    "status")
+      log "status requested (by $from)"
+      reply "$from" "$(status_line)" ;;
+    *)
+      log "unknown command from $from: $cmd"; return 1 ;;
+  esac
+}
+
+# LTE connected without IPv4 (operator rejected the IPv4 call): reconnect, at most once per 5 minutes
+NO_V4_SINCE=0; LAST_FIX=0
+check_lte_ipv4() {
+  local b k v4 now; now=$(date +%s)
+  nmcli -t -f NAME con show --active | grep -qx "$LTE_CON" || { NO_V4_SINCE=0; return; }
+  b=$(mmcli -m any -K 2>/dev/null | sed -n "s/^modem.generic.bearers.value.*: //p" | head -1)
+  [ -n "$b" ] || return
+  k=$(mmcli -b "$b" -K 2>/dev/null)
+  grep -q "^bearer.status.connected *: yes" <<<"$k" || return
+  v4=$(sed -n "s/^bearer.ipv4-config.address *: //p" <<<"$k")
+  if [ -n "$v4" ] && [ "$v4" != "--" ]; then NO_V4_SINCE=0; return; fi
+  [ "$NO_V4_SINCE" -eq 0 ] && NO_V4_SINCE=$now
+  if [ $((now - NO_V4_SINCE)) -ge 60 ] && [ $((now - LAST_FIX)) -ge 300 ]; then
+    log "LTE connected without IPv4 for $((now - NO_V4_SINCE))s, reconnecting"
+    nmcli con down "$LTE_CON" >/dev/null 2>&1; sleep 3; nmcli con up "$LTE_CON" >/dev/null 2>&1
+    LAST_FIX=$now; NO_V4_SINCE=0
+  fi
+}
+
+declare -A SEEN
+log "started; senders: $SENDERS; allowed: ${ALLOWED:-none}; reply: $REPLY"
+[ "$SENDERS" = any ] && log "WARNING: SENDERS=any, commands from every number are accepted"
+[ "$SENDERS" = whitelist ] && [ -z "$ALLOWED" ] && log "WARNING: ALLOWED is empty, all commands will be ignored"
+
+while true; do
+  # Keep the radio registered so SMS can arrive (unless it was switched fully off on purpose)
+  if [ ! -e "$RADIO_OFF_FLAG" ] && [ "$(mmk modem.generic.state)" = disabled ]; then
+    mmcli -m any -e >/dev/null 2>&1 && log "modem radio re-enabled for SMS"
+  fi
+
+  for id in $(mmcli -m any --messaging-list-sms 2>/dev/null | grep -o 'SMS/[0-9]*' | cut -d/ -f2); do
+    k=$(mmcli -s "$id" -K 2>/dev/null) || continue
+    [ "$(smsk sms.properties.state "$k")" = received ] || continue
+    from=$(smsk sms.content.number "$k")
+    text=$(smsk sms.content.text "$k")
+    key="$id|$(smsk sms.properties.timestamp "$k")"
+    [ -n "${SEEN[$key]}" ] && continue
+    SEEN[$key]=1
+    cmd=$(tr '[:upper:]' '[:lower:]' <<<"$text" | tr -s ' \t\r\n' ' ' | sed 's/^ //; s/ $//')
+    if allowed "$from"; then
+      handle "$from" "$cmd"
+      mmcli -m any --messaging-delete-sms="$id" >/dev/null 2>&1
+    fi
+  done
+  check_lte_ipv4
+  sleep "$INTERVAL"
+done

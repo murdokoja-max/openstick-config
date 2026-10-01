@@ -1,0 +1,9 @@
+# openstick-smsd configuration — restart after editing: sudo systemctl restart openstick-smsd
+# Who may send commands: whitelist (only ALLOWED) or any (every sender — anyone who knows the number)
+SENDERS=whitelist
+# Numbers allowed to send commands (space separated; +62 / 62 / 0 prefixes are all accepted)
+ALLOWED=""
+# Reply to commands by SMS (yes/no). Each reply costs SMS credit.
+REPLY=no
+# Seconds between inbox checks
+INTERVAL=10

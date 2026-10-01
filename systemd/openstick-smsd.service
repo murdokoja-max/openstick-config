@@ -1,0 +1,12 @@
+[Unit]
+Description=OpenStick SMS remote control (lte/wifi on/off)
+After=ModemManager.service NetworkManager.service
+Wants=ModemManager.service
+
+[Service]
+ExecStart=/usr/local/bin/openstick-smsd
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
