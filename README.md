@@ -45,6 +45,9 @@ asks for confirmation first.
 
 ## Install
 
+New stick still on Android? Follow [docs/flashing-uz801.md](docs/flashing-uz801.md) first
+(backup, flashing Debian, fixing LTE).
+
 ```bash
 git clone https://github.com/murdokoja-max/openstick-config.git
 cd openstick-config
