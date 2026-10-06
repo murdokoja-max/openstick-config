@@ -11,7 +11,7 @@ openstick · LTE connected · Wi-Fi disabled · modem 52C
   3) SMS control    active · whitelist: +6281234567890
   4) USB mode       host · boot: host
   5) System         password · hostname · timezone · reboot
-  6) About          openstick-config 2.0
+  6) About          openstick-config 2.1
 ```
 
 ```
@@ -32,7 +32,7 @@ Network
 | **Network › Wi-Fi** | Radio on/off, scan and connect, forget networks, DHCP/static IP |
 | **Network › Hotspot** | On/off, SSID and password shown and editable, start at boot, connected clients, internet source (LTE first or LAN/Wi-Fi first) |
 | **Network › LTE modem** | Mobile data on/off (radio stays registered), radio fully off, APN, 4G/3G mode, IP/DNS, SIM and IMEI info (read only), restart |
-| **Network › LAN** | USB Ethernet adapter on/off, DHCP / static / share internet |
+| **Network › LAN** | USB Ethernet adapter on/off, DHCP / static, and **LTE → LAN**: turn the adapter into a router (static 192.168.x.x/24 gateway, DHCP .100–.150, NAT out through LTE) so a switch/router WAN port or PC can use the modem as internet; shows connected clients |
 | **Network › USB network** | IP settings for `usb0` when the modem is a USB gadget |
 | **Network › Tailscale** | Connect/disconnect, exit node on/off |
 | **SMS control** | Commands by SMS (`lte on`, `lte off`, `wifi on`, `wifi off`, `status`), whitelist or any sender, optional replies |

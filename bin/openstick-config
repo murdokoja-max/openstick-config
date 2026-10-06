@@ -5,7 +5,7 @@
 
 [ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
 
-VERSION=2.0
+VERSION=2.1
 TITLE="OpenStick Configuration Tool"
 ROLE=/sys/class/usb_role/ci_hdrc.0-role-switch/role
 USB_SVC=usb-host.service
@@ -132,6 +132,7 @@ NETWORK
     IPv6     $(lte_ip 6)
     APN      $(nmcli -g gsm.apn con show "$LTE_CON" 2>/dev/null)
   LAN        $(lan_dev) $(st_lan)
+    LTE→LAN  $(st_lanshare)
   USB net    $(st_usbnet)
   Tailscale  $(st_ts)
 
@@ -413,15 +414,73 @@ lan_ensure() {
   LANDEV=$dev
 }
 
+# LTE → LAN router: the USB LAN port gets a static gateway address, DHCP from the system dnsmasq
+# and NAT out through LTE (rules.v4 masquerades 192.168.0.0/16, so the subnet must be 192.168.x.x/24).
+# The dnsmasq lines live between marker comments so they can be removed cleanly.
+DNSMASQ_CONF=/etc/dnsmasq.conf
+LAN_SHARE_BEGIN="# openstick-config: LTE-to-LAN begin"
+LAN_SHARE_END="# openstick-config: LTE-to-LAN end"
+LAN_SHARE_ADDR=192.168.50.1/24
+
+lan_share_on() { grep -q "^dhcp-range=interface:$(lan_dev)," $DNSMASQ_CONF 2>/dev/null; }
+lan_share_addr() { lan_share_on && nmcli -g ipv4.addresses con show "$LAN_CON" || echo "$LAN_SHARE_ADDR"; }
+st_lanshare() {
+  lan_share_on || { echo "off"; return; }
+  echo "on · $(nmcli -g ipv4.addresses con show "$LAN_CON") · internet via $(hotspot_uplink)"
+}
+lan_share_clear() {
+  # Marker block, plus hand-written lines for the same adapter
+  sed -i -e "/^$LAN_SHARE_BEGIN\$/,/^$LAN_SHARE_END\$/d" -e "/^dhcp-\(range\|option\)=interface:$(lan_dev),/d" $DNSMASQ_CONF
+}
+
+lan_share_enable() {
+  # $1 = router address a.b.c.1/24
+  local addr="$1" ip pre
+  ip=${addr%/*}; pre=${ip%.*}
+  [[ "$addr" =~ ^192\.168\.[0-9]{1,3}\.[0-9]{1,3}/24$ ]] || { echo "Use a 192.168.x.x/24 address (the NAT rule covers 192.168.0.0/16)."; return 1; }
+  [ "$(ipof wlan0 | cut -d. -f1-3)" = "$pre" ] && { echo "That subnet is already used by Wi-Fi."; return 1; }
+  [ -f $DNSMASQ_CONF.bak-before-lan-share ] || cp $DNSMASQ_CONF $DNSMASQ_CONF.bak-before-lan-share
+  nmcli con modify "$LAN_CON" ipv4.method manual ipv4.addresses "$addr" ipv4.gateway "" ipv4.dns "" \
+    ipv4.never-default yes ipv6.method ignore || return 1
+  lan_share_clear
+  cat >> $DNSMASQ_CONF <<EOF
+$LAN_SHARE_BEGIN
+dhcp-range=interface:$LANDEV,$pre.100,$pre.150,12h
+dhcp-option=interface:$LANDEV,option:router,$ip
+$LAN_SHARE_END
+EOF
+  echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/90-openstick-forward.conf
+  sysctl -q -w net.ipv4.ip_forward=1
+  con_active "$LTE_CON" || nmcli con up "$LTE_CON" >/dev/null 2>&1
+  nmcli con up "$LAN_CON" >/dev/null 2>&1
+  systemctl restart dnsmasq
+}
+
+lan_share_disable() {
+  lan_share_clear
+  nmcli con modify "$LAN_CON" ipv4.method auto ipv4.addresses "" ipv4.never-default no ipv6.method auto || return 1
+  systemctl restart dnsmasq
+  nmcli con up "$LAN_CON" >/dev/null 2>&1
+}
+
+lan_share_clients() {
+  local f=/var/lib/misc/dnsmasq.leases ip pre
+  ip=$(nmcli -g ipv4.addresses con show "$LAN_CON"); pre=${ip%.*}
+  [ -s "$f" ] && awk -v p="$pre." 'index($3,p)==1 {printf "  %-15s %-17s %s\n", $3, $2, ($4=="*"?"-":$4)}' "$f" | grep . || echo "  (none)"
+}
+
 lan_menu() {
-  local c on
+  local c on sh a
   while true; do
     lan_ensure || return
     con_active "$LAN_CON" && on=1 || on=0
+    lan_share_on && sh=1 || sh=0
     c=$(menu "Network › LAN ($LANDEV)\n$(st_lan) · method: $(nmcli -g ipv4.method con show $LAN_CON)" \
         1 "$(row "LAN" "$([ $on = 1 ] && echo "ON  → turn off (stays off after boot)" || echo "OFF → turn on (also at boot)")")" \
         2 "IP settings (DHCP / static / share internet)" \
-        3 "Details") || return
+        3 "Details" \
+        4 "$(row "LTE → LAN" "$([ $sh = 1 ] && echo "ON  → turn off (LAN becomes a normal client)" || echo "OFF → turn on (LAN clients use LTE)")")" \
+        5 "LTE → LAN: router address / clients") || return
     case $c in
       1) if [ $on = 1 ]; then
            warn_remote "Turn LAN off?" || continue
@@ -431,6 +490,21 @@ lan_menu() {
          fi ;;
       2) ip_menu "$LAN_CON" "LAN" 1 ;;
       3) msg "$(nmcli -f GENERAL.DEVICE,GENERAL.HWADDR,GENERAL.STATE,CAPABILITIES.SPEED,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS dev show $LANDEV)" ;;
+      4) if [ $sh = 1 ]; then
+           warn_remote "Turn LTE → LAN off? The LAN port goes back to DHCP client." || continue
+           run lan_share_disable
+         else
+           con_active "$LTE_CON" || msg "Note: mobile data is off; it will be turned on now."
+           yesno "Share LTE to the LAN port?\n\nLAN port becomes a router: $(lan_share_addr), DHCP .100-.150, NAT through LTE.\nPlug it into a switch/router WAN port or a PC. This uses mobile data quota and makes the modem warmer." || continue
+           run lan_share_enable "$(lan_share_addr)"
+         fi ;;
+      5) if [ $sh = 1 ]; then
+           a=$(input "Router address for the LAN port (192.168.x.x/24).\nClients get DHCP .100-.150 on that subnet." "$(lan_share_addr)") || continue
+           [ "$a" = "$(lan_share_addr)" ] || run lan_share_enable "$a"
+           msg "LAN clients (IP / MAC / name):\n\n$(lan_share_clients)"
+         else
+           msg "LTE → LAN is off. Turn it on first (default router address $LAN_SHARE_ADDR)."
+         fi ;;
     esac
   done
 }
