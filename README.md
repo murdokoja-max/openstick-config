@@ -8,10 +8,11 @@ Tailscale and basic system settings in one place, with the live state shown on e
 openstick · LTE connected · Wi-Fi disabled · modem 52C
   1) Status         overview of all connections
   2) Network        Wi-Fi · Hotspot · LTE · LAN · USB · Tailscale
-  3) SMS control    active · whitelist: +6281234567890
-  4) USB mode       host · boot: host
-  5) System         password · hostname · timezone · reboot
-  6) About          openstick-config 2.1
+  3) Messages       read and send SMS · 0 stored on the modem
+  4) SMS control    active · whitelist: +6281234567890
+  5) USB mode       host · boot: host
+  6) System         password · hostname · timezone · reboot
+  7) About          openstick-config 2.2
 ```
 
 ```
@@ -35,6 +36,7 @@ Network
 | **Network › LAN** | USB Ethernet adapter on/off, DHCP / static, and **LTE → LAN**: turn the adapter into a router (static 192.168.x.x/24 gateway, DHCP .100–.150, NAT out through LTE) so a switch/router WAN port or PC can use the modem as internet; shows connected clients |
 | **Network › USB network** | IP settings for `usb0` when the modem is a USB gadget |
 | **Network › Tailscale** | Connect/disconnect, exit node on/off |
+| **Messages** | Read the inbox (newest first), reply, delete; write and send an SMS (numbers like `0812…` are turned into `+62812…`); list of messages sent from the tool. Without the menu: `openstick-config --sms-send NUMBER TEXT` and `--sms-list` |
 | **SMS control** | Commands by SMS (`lte on`, `lte off`, `wifi on`, `wifi off`, `status`), whitelist or any sender, optional replies |
 | **USB mode** | Switch host/device now, choose the mode used at boot, `lsusb` |
 | **System** | Password, hostname, timezone (WIB/WITA/WIT), log, reboot, shutdown |

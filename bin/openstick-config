@@ -5,7 +5,7 @@
 
 [ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
 
-VERSION=2.1
+VERSION=2.2
 TITLE="OpenStick Configuration Tool"
 ROLE=/sys/class/usb_role/ci_hdrc.0-role-switch/role
 USB_SVC=usb-host.service
@@ -558,6 +558,120 @@ network_menu() {
   done
 }
 
+# ---------- Messages (read / send SMS) ----------
+SMS_SENT_LOG=/var/log/openstick-sms-sent.log   # tab separated: time, number, text (modem does not keep sent SMS)
+sms_ids() { mmcli -m any --messaging-list-sms 2>/dev/null | grep -o 'SMS/[0-9]*' | cut -d/ -f2 | sort -rn; }
+# mmcli -K prints non-ASCII bytes as \342\200\231; decode them back to UTF-8
+smsf() {
+  local v; v=$(awk -F' +: ' -v k="$1" '$1==k {sub(/^[^:]*: /, ""); print; exit}' <<<"$2")
+  printf '%b' "$(sed 's/\\\([0-7][0-7][0-7]\)/\\0\1/g' <<<"$v")"
+}
+st_msgs() { echo "$(sms_ids | wc -l) stored on the modem"; }
+
+# "0812..." / "62812..." / "+62812..." → +62812...
+sms_number() {
+  local n=${1//[ -]/}
+  [[ $n == 0* ]] && n=+62${n#0}
+  [[ $n == 62* && ${#n} -ge 10 ]] && n=+$n
+  [[ $n =~ ^\+?[0-9]{3,15}$ ]] || return 1
+  echo "$n"
+}
+
+# sms_send NUMBER TEXT → prints the result; non-zero exit on failure
+sms_send() {
+  local to text="${2//\'/’}" out path
+  to=$(sms_number "$1") || { echo "Invalid number: $1"; return 1; }
+  [ -n "$2" ] || { echo "Empty message."; return 1; }
+  out=$(mmcli -m any --messaging-create-sms="text='$text',number='$to'" 2>&1) || { echo "${out:0:500}"; return 1; }
+  path=$(grep -o 'SMS/[0-9]*' <<<"$out" | cut -d/ -f2 | head -1)
+  [ -n "$path" ] || { echo "Could not create the message: ${out:0:300}"; return 1; }
+  if out=$(mmcli -s "$path" --send 2>&1); then
+    printf '%s\t%s\t%s\n' "$(date '+%F %T')" "$to" "$2" >> $SMS_SENT_LOG
+    mmcli -m any --messaging-delete-sms="$path" >/dev/null 2>&1
+    echo "Sent to $to."
+  else
+    mmcli -m any --messaging-delete-sms="$path" >/dev/null 2>&1
+    echo "Send failed: ${out:0:500}"; return 1
+  fi
+}
+
+sms_compose() {
+  # $1 = recipient (optional, used by Reply)
+  local to="$1" text
+  [ -n "$to" ] || to=$(input "Send to (e.g. +6281234567890 or 0812...):" "") || return
+  to=$(sms_number "$to") || { msg "That does not look like a phone number."; return; }
+  text=$(input "Message to $to\n(160 characters per SMS, longer text is split and costs more)" "") || return
+  [ -n "$text" ] || return
+  yesno "Send to $to?\n\n${text:0:200}\n\nEach SMS costs credit." || return
+  info "Sending..."
+  run sms_send "$to" "$text"
+}
+
+sms_view() {
+  local id="$1" k from text ts c
+  k=$(mmcli -s "$id" -K 2>/dev/null) || { msg "Message not found."; return; }
+  from=$(smsf sms.content.number "$k"); text=$(smsf sms.content.text "$k"); ts=$(smsf sms.properties.timestamp "$k")
+  msg "From: $from\nDate: ${ts/T/ }\n\n$text"
+  c=$(menu "Message from $from" 1 "Reply" 2 "Delete" ) || return
+  case $c in
+    1) sms_compose "$from" ;;
+    2) yesno "Delete this message?" && run mmcli -m any --messaging-delete-sms="$id" ;;
+  esac
+}
+
+sms_inbox() {
+  local list id k st n=0 c
+  while true; do
+    list=(); n=0
+    info "Reading messages..."
+    for id in $(sms_ids | head -30); do
+      k=$(mmcli -s "$id" -K 2>/dev/null) || continue
+      st=$(smsf sms.properties.state "$k")
+      [ "$st" = received ] || continue
+      list+=("$id" "$(printf '%-11s %-14s %s' "$(smsf sms.properties.timestamp "$k" | sed 's/^....-//;s/T/ /' | cut -c1-11)" \
+        "$(smsf sms.content.number "$k")" "$(smsf sms.content.text "$k" | tr '\n' ' ' | cut -c1-34)")")
+      n=$((n+1))
+    done
+    [ $n -gt 0 ] || { msg "Inbox is empty."; return; }
+    c=$(menu "Inbox · $n received (newest first, max 30)" "${list[@]}") || return
+    sms_view "$c"
+  done
+}
+
+sms_sent() {
+  local lines=() list=() i=0 line c ts to text
+  [ -s $SMS_SENT_LOG ] || { msg "Nothing sent from this tool yet."; return; }
+  mapfile -t lines < <(tail -30 $SMS_SENT_LOG | tac)
+  for line in "${lines[@]}"; do
+    IFS=$'\t' read -r ts to text <<<"$line"
+    list+=("$i" "$(printf '%-11s %-14s %s' "${ts:5:11}" "$to" "${text:0:34}")"); i=$((i+1))
+  done
+  while true; do
+    c=$(menu "Sent (newest first, max 30)" "${list[@]}") || return
+    IFS=$'\t' read -r ts to text <<<"${lines[$c]}"
+    msg "To: $to\nDate: $ts\n\n$text"
+  done
+}
+
+messages_menu() {
+  local c
+  while true; do
+    refresh
+    c=$(menu "Messages · $(st_msgs)\nSMS control commands from whitelisted numbers are deleted after they run." \
+        1 "$(row "Inbox" "read received messages")" \
+        2 "$(row "Write" "send a message")" \
+        3 "$(row "Sent" "messages sent from this tool")" \
+        4 "$(row "Delete all" "remove everything stored on the modem")") || return
+    case $c in
+      1) sms_inbox ;;
+      2) sms_compose ;;
+      3) sms_sent ;;
+      4) yesno "Delete ALL messages stored on the modem?" && \
+           { for id in $(sms_ids); do mmcli -m any --messaging-delete-sms="$id" >/dev/null 2>&1; done; msg "Done."; } ;;
+    esac
+  done
+}
+
 # ---------- SMS remote control ----------
 sms_menu() {
   local c nums active reply senders
@@ -641,7 +755,16 @@ sys_menu() {
 }
 
 # ---------- main ----------
-if [ "${1:-}" = "--status" ]; then status_text; exit 0; fi
+case "${1:-}" in
+  --status)   status_text; exit 0 ;;
+  --sms-send) [ $# -ge 3 ] || { echo "Usage: openstick-config --sms-send NUMBER TEXT..."; exit 2; }
+              n=$2; shift 2; sms_send "$n" "$*"; exit $? ;;
+  --sms-list) for id in $(sms_ids | tac); do
+                k=$(mmcli -s "$id" -K 2>/dev/null) || continue
+                printf '%s\t%s\t%s\t%s\n' "$(smsf sms.properties.state "$k")" "$(smsf sms.properties.timestamp "$k")" \
+                  "$(smsf sms.content.number "$k")" "$(smsf sms.content.text "$k")"
+              done; exit 0 ;;
+esac
 command -v whiptail >/dev/null || { echo "whiptail is not installed: sudo apt install whiptail"; exit 1; }
 
 while true; do
@@ -649,16 +772,18 @@ while true; do
   c=$(BACK=Finish menu "$(hostname) · LTE $(mmk modem.generic.state) · Wi-Fi $(nmcli radio wifi) · $(temps | awk '{print $1" "$2}')" \
       1 "$(row "Status" "overview of all connections")" \
       2 "$(row "Network" "Wi-Fi · Hotspot · LTE · LAN · USB · Tailscale")" \
-      3 "$(row "SMS control" "$(st_sms)")" \
-      4 "$(row "USB mode" "$(st_usb)")" \
-      5 "$(row "System" "password · hostname · timezone · reboot")" \
-      6 "$(row "About" "openstick-config $VERSION")") || { clear; exit 0; }
+      3 "$(row "Messages" "read and send SMS · $(st_msgs)")" \
+      4 "$(row "SMS control" "$(st_sms)")" \
+      5 "$(row "USB mode" "$(st_usb)")" \
+      6 "$(row "System" "password · hostname · timezone · reboot")" \
+      7 "$(row "About" "openstick-config $VERSION")") || { clear; exit 0; }
   case $c in
     1) msg "$(status_text)" ;;
     2) network_menu ;;
-    3) sms_menu ;;
-    4) usb_menu ;;
-    5) sys_menu ;;
-    6) msg "openstick-config $VERSION\nConfiguration tool for the OpenStick UZ801 modem (MSM8916)\nDebian $(cat /etc/debian_version), kernel $(uname -r)\n\nRun: sudo openstick-config\nQuick status: openstick-config --status" ;;
+    3) messages_menu ;;
+    4) sms_menu ;;
+    5) usb_menu ;;
+    6) sys_menu ;;
+    7) msg "openstick-config $VERSION\nConfiguration tool for the OpenStick UZ801 modem (MSM8916)\nDebian $(cat /etc/debian_version), kernel $(uname -r)\n\nRun: sudo openstick-config\nQuick status: openstick-config --status" ;;
   esac
 done
