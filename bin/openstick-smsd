@@ -11,6 +11,7 @@ REPLY=no
 INTERVAL=10
 LTE_CON=lte
 RADIO_OFF_FLAG=/etc/openstick-sms.radio-off
+AT_DEV=/dev/wwan0at1   # secondary AT port used for the SIM-memory fallback scan
 [ -f "$CONF" ] && . "$CONF"
 
 log() { echo "$*"; }  # stdout goes to the journal (tag: openstick-smsd)
@@ -93,6 +94,68 @@ check_lte_ipv4() {
   fi
 }
 
+# Direct SIM-memory fallback scan over AT. Some inbound SMS have been observed to
+# land in SIM storage ("SM") without the QMI/WMS path (mmcli --messaging-list-sms)
+# ever surfacing them. This talks to the secondary AT port directly, lists every
+# message sitting in SIM storage, feeds each one through the normal command
+# pipeline, and deletes it from the SIM once handled (whether the command matched
+# or not, matching the existing mmcli-path behavior).
+check_sim_storage() {
+  [ -c "$AT_DEV" ] || return
+  local raw idx from text line pending=0
+  raw=$(
+    exec 3<>"$AT_DEV" 2>/dev/null || exit 1
+    stty -F "$AT_DEV" 115200 raw -echo 2>/dev/null
+    cat <&3 & local p=$!
+    sleep 0.2
+    printf 'AT+CMGF=1\r\n' >&3
+    sleep 0.3
+    printf 'AT+CPMS="SM","SM","SM"\r\n' >&3
+    sleep 0.5
+    printf 'AT+CMGL="ALL"\r\n' >&3
+    sleep 1.5
+    kill "$p" 2>/dev/null
+  )
+  [ -n "$raw" ] || return
+
+  while IFS= read -r line; do
+    if [[ "$line" == '+CMGL: '* ]]; then
+      if [ "$pending" = 1 ] && [ -n "$idx" ]; then
+        if allowed "$from"; then
+          handle "$from" "$(tr '[:upper:]' '[:lower:]' <<<"$text" | tr -s ' \t\r\n' ' ' | sed 's/^ //; s/ $//')"
+        fi
+        at_cmgd "$idx"
+      fi
+      idx=$(sed -n 's/^+CMGL: \([0-9]*\),.*/\1/p' <<<"$line")
+      from=$(sed -n 's/^+CMGL: [0-9]*,"[^"]*","\([^"]*\)".*/\1/p' <<<"$line")
+      text=""; pending=1
+    elif [[ "$line" == "OK"* || -z "$line" ]]; then
+      :
+    elif [ "$pending" = 1 ]; then
+      text="${text:+$text }${line%$'\r'}"
+    fi
+  done <<<"$raw"
+
+  if [ "$pending" = 1 ] && [ -n "$idx" ]; then
+    if allowed "$from"; then
+      handle "$from" "$(tr '[:upper:]' '[:lower:]' <<<"$text" | tr -s ' \t\r\n' ' ' | sed 's/^ //; s/ $//')"
+    fi
+    at_cmgd "$idx"
+  fi
+}
+
+at_cmgd() {
+  local idx="$1"
+  [ -c "$AT_DEV" ] || return
+  (
+    exec 3<>"$AT_DEV" 2>/dev/null || exit 1
+    stty -F "$AT_DEV" 115200 raw -echo 2>/dev/null
+    printf 'AT+CMGD=%s\r\n' "$idx" >&3
+    sleep 0.5
+  ) 2>/dev/null
+  log "SIM-memory SMS index $idx read and deleted"
+}
+
 declare -A SEEN
 log "started; senders: $SENDERS; allowed: ${ALLOWED:-none}; reply: $REPLY"
 [ "$SENDERS" = any ] && log "WARNING: SENDERS=any, commands from every number are accepted"
@@ -118,6 +181,10 @@ while true; do
       mmcli -m any --messaging-delete-sms="$id" >/dev/null 2>&1
     fi
   done
+
+  # Fallback: catch anything sitting in SIM storage that QMI/WMS never surfaced
+  check_sim_storage
+
   check_lte_ipv4
   sleep "$INTERVAL"
 done
